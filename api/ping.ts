@@ -1,12 +1,14 @@
-export const runtime = "edge";
+// api/ping.ts — Node serverless sanity check
+export const runtime = "nodejs18.x";
 
-export default async function handler() {
-  return new Response(JSON.stringify({ ok: true }), {
-    status: 200,
-    headers: {
-      "content-type": "application/json",
-      "access-control-allow-origin": "*",
-    },
-  });
+export default async function handler(req: any, res: any) {
+  res.setHeader("content-type", "application/json");
+  res.setHeader("access-control-allow-origin", "*");
+  if (req.method === "OPTIONS") {
+    res.status(200).send(JSON.stringify({ ok: true }));
+    return;
+  }
+  res.status(200).send(JSON.stringify({ ok: true, runtime: "node" }));
 }
+
 

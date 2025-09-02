@@ -1,5 +1,7 @@
-// api/suggest.ts — Vercel Edge Function
+// api/suggest.ts — Vercel Edge Function (stabiele variant)
 export const runtime = "edge";
+// Optioneel: voorkom caching in sommige setups
+export const dynamic = "force-dynamic";
 
 function json(data: any, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -14,46 +16,55 @@ function json(data: any, status = 200) {
 }
 
 export default async function handler(req: Request) {
-  if (req.method === "OPTIONS") return json({ ok: true });
-
-  // Healthcheck
-  if (req.method === "GET") {
-    const url = new URL(req.url);
-    if (url.searchParams.get("ping")) return json({ pong: true });
-    return json({ ok: true, hint: "POST { prompt } to this endpoint" });
-  }
-
-  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
-
-  let body: any;
   try {
-    body = await req.json();
-  } catch {
-    return json({ error: "Invalid JSON body" }, 400);
-  }
+    if (req.method === "OPTIONS") return json({ ok: true });
 
-  const prompt: string = body?.prompt ?? "";
-  if (!prompt) return json({ error: "Missing 'prompt' in body" }, 400);
+    // Healthcheck (GET /api/suggest?ping=1)
+    if (req.method === "GET") {
+      let ping = false;
+      try {
+        const url = new URL(req.url ?? "");
+        ping = url.searchParams.get("ping") != null;
+      } catch {
+        // ignore URL parse errors
+      }
+      if (ping) return json({ pong: true });
+      return json({ ok: true, hint: "POST { prompt } to this endpoint" });
+    }
 
-  // Edge runtime: geen Node types, dus haal env via globalThis om TS stil te krijgen
-const env = (globalThis as any).process?.env ?? {};
-const key: string | undefined = env.OPENAI_API_KEY;
+    if (req.method !== "POST") {
+      return json({ error: "Method not allowed" }, 405);
+    }
 
-  // Fallback zonder key zodat je kunt testen
-  if (!key) {
-    return json({
-      model: "dummy",
-      suggestions: [
-        `Icebreaker over: ${prompt} (1)`,
-        `Icebreaker over: ${prompt} (2)`,
-        `Icebreaker over: ${prompt} (3)`,
-      ],
-      note: "OPENAI_API_KEY ontbreekt — dummy response",
-    });
-  }
+    // Body parsing
+    let body: any = null;
+    try {
+      body = await req.json();
+    } catch {
+      return json({ error: "Invalid JSON body" }, 400);
+    }
 
-  // OpenAI-call (zonder extra npm packages)
-  try {
+    const prompt: string = (body?.prompt ?? "").toString().trim();
+    if (!prompt) return json({ error: "Missing 'prompt' in body" }, 400);
+
+    // Edge runtime: geen Node types – haal env via globalThis (zonder TS-errors)
+    const env = (globalThis as any).process?.env ?? {};
+    const key: string | undefined = env.OPENAI_API_KEY;
+
+    // Fallback zonder key
+    if (!key) {
+      return json({
+        model: "dummy",
+        suggestions: [
+          `Icebreaker over: ${prompt} (1)`,
+          `Icebreaker over: ${prompt} (2)`,
+          `Icebreaker over: ${prompt} (3)`,
+        ],
+        note: "OPENAI_API_KEY ontbreekt — dummy response",
+      });
+    }
+
+    // OpenAI-call (zonder npm client)
     const r = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -75,12 +86,12 @@ const key: string | undefined = env.OPENAI_API_KEY;
     });
 
     if (!r.ok) {
-      const errText = await r.text();
-      return json({ error: "OpenAI error", detail: errText }, r.status);
+      const detail = await safeText(r);
+      return json({ error: "OpenAI error", detail }, r.status);
     }
 
-    const data = await r.json();
-    const text: string = data.choices?.[0]?.message?.content ?? "";
+    const data = await safeJson(r);
+    const text: string = data?.choices?.[0]?.message?.content ?? "";
     const suggestions = text
       .split("\n")
       .map((s: string) => s.replace(/^[\-\*\d\.\s]+/, ""))
@@ -89,6 +100,25 @@ const key: string | undefined = env.OPENAI_API_KEY;
 
     return json({ model: "gpt-4o-mini", suggestions });
   } catch (e: any) {
+    // Log verschijnt in Vercel function logs
+    console.error("suggest.ts crash:", e);
     return json({ error: "Server error", detail: String(e) }, 500);
+  }
+}
+
+// Helpers: defensief parsen
+async function safeText(res: Response) {
+  try {
+    return await res.text();
+  } catch {
+    return "<no body>";
+  }
+}
+async function safeJson(res: Response) {
+  try {
+    return await res.json();
+  } catch {
+    const t = await safeText(res);
+    return { raw: t };
   }
 }

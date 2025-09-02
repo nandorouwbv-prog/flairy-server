@@ -1,5 +1,27 @@
 {
   "name": "flairy-server",
   "version": "1.0.0",
-  "private": true
+  "private": true,
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nandorouwbv-prog/flairy-server.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/nandorouwbv-prog/flairy-server/issues"
+  },
+  "homepage": "https://github.com/nandorouwbv-prog/flairy-server#readme",
+  "devDependencies": {
+    "@types/node": "^24.3.0"
+  },
+  "dependencies": {
+    "undici-types": "^7.10.0"
+  }
 }

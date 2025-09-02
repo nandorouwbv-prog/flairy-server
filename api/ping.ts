@@ -3,10 +3,10 @@ export default async function handler(req: any, res: any) {
   res.setHeader("content-type", "application/json");
   res.setHeader("access-control-allow-origin", "*");
   if (req.method === "OPTIONS") {
-    res.status(200).send(JSON.stringify({ ok: true }));
+    res.status(200).send("{}");
     return;
   }
-  res.status(200).send(JSON.stringify({ ok: true, runtime: "node" }));
+  res.status(200).send(JSON.stringify({ ok: true, runtime: "node18" }));
 }
 
 

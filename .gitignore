@@ -1,0 +1,13 @@
+# deps
+node_modules/
+pnpm-lock.yaml
+yarn.lock
+
+# env/secrets
+.env
+.env.*
+
+# vercel & build
+.vercel/
+dist/
+build/

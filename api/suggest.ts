@@ -1,64 +1,94 @@
-// utils/aiService.ts
-export type Suggestion = {
-  id: string;
-  style: "safe" | "playful" | "flirty";
-  text: string;
-  why: string;
-};
+// api/suggest.ts — Vercel Edge Function
+export const runtime = "edge";
 
-const ENDPOINT = "https://<JOUW-VERCEL-URL>/api/suggest"; // 👈 vul jouw URL in
-
-type GetOpts = {
-  input: string;
-  language?: "nl" | "en";
-  persona?: "funny" | "classy" | "wingwoman";
-  flirtLevel?: "safe" | "playful" | "flirty";
-};
-
-export async function getSuggestions(input: string, opts?: Omit<GetOpts, "input">): Promise<Suggestion[]> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15_000);
-
-  try {
-    const res = await fetch(ENDPOINT, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        input,
-        language: opts?.language,
-        persona: opts?.persona,
-        flirtLevel: opts?.flirtLevel,
-      }),
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      const text = await res.text();
-      console.warn("AI endpoint error:", text);
-      return fallbackSuggestions();
-    }
-
-    const json = await res.json();
-    const arr = Array.isArray(json?.suggestions) ? json.suggestions : [];
-
-    return arr.slice(0, 3).map((s: any, i: number) => ({
-      id: `s${i + 1}`,
-      style: s?.style === "flirty" ? "flirty" : s?.style === "playful" ? "playful" : "safe",
-      text: String(s?.text ?? ""),
-      why: String(s?.why ?? ""),
-    }));
-  } catch (e) {
-    console.warn("AI call failed:", e);
-    return fallbackSuggestions();
-  } finally {
-    clearTimeout(timeout);
-  }
+function json(data: any, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "content-type": "application/json",
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "GET,POST,OPTIONS",
+      "access-control-allow-headers": "content-type,authorization",
+    },
+  });
 }
 
-function fallbackSuggestions(): Suggestion[] {
-  return [
-    { id: "f1", style: "safe",    text: "Leuk! Vertel eens, wat vind je daar het leukste aan?", why: "Open vraag houdt het gesprek gaande." },
-    { id: "f2", style: "playful", text: "Oké, je krijgt 1 vraag: stranddag of stadswandeling? 😄", why: "Speelse keuze triggert energie." },
-    { id: "f3", style: "flirty",  text: "We matchen qua vibe—zullen we dat testen met koffie? ☕️", why: "Vriendelijk en direct naar afspraak." }
-  ];
+export default async function handler(req: Request) {
+  if (req.method === "OPTIONS") return json({ ok: true });
+
+  // Healthcheck
+  if (req.method === "GET") {
+    const url = new URL(req.url);
+    if (url.searchParams.get("ping")) return json({ pong: true });
+    return json({ ok: true, hint: "POST { prompt } to this endpoint" });
+  }
+
+  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
+
+  let body: any;
+  try {
+    body = await req.json();
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  const prompt: string = body?.prompt ?? "";
+  if (!prompt) return json({ error: "Missing 'prompt' in body" }, 400);
+
+  // Edge runtime: geen Node types, dus haal env via globalThis om TS stil te krijgen
+const env = (globalThis as any).process?.env ?? {};
+const key: string | undefined = env.OPENAI_API_KEY;
+
+  // Fallback zonder key zodat je kunt testen
+  if (!key) {
+    return json({
+      model: "dummy",
+      suggestions: [
+        `Icebreaker over: ${prompt} (1)`,
+        `Icebreaker over: ${prompt} (2)`,
+        `Icebreaker over: ${prompt} (3)`,
+      ],
+      note: "OPENAI_API_KEY ontbreekt — dummy response",
+    });
+  }
+
+  // OpenAI-call (zonder extra npm packages)
+  try {
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${key}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content:
+              "You generate short, catchy dating app openers. Return only bullet points.",
+          },
+          { role: "user", content: `Give 5 openers about: ${prompt}` },
+        ],
+        temperature: 0.8,
+      }),
+    });
+
+    if (!r.ok) {
+      const errText = await r.text();
+      return json({ error: "OpenAI error", detail: errText }, r.status);
+    }
+
+    const data = await r.json();
+    const text: string = data.choices?.[0]?.message?.content ?? "";
+    const suggestions = text
+      .split("\n")
+      .map((s: string) => s.replace(/^[\-\*\d\.\s]+/, ""))
+      .filter((s: string) => s.trim().length > 0)
+      .slice(0, 5);
+
+    return json({ model: "gpt-4o-mini", suggestions });
+  } catch (e: any) {
+    return json({ error: "Server error", detail: String(e) }, 500);
+  }
 }

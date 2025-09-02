@@ -1,6 +1,4 @@
 // api/ping.ts — Node serverless sanity check
-export const runtime = "nodejs18.x";
-
 export default async function handler(req: any, res: any) {
   res.setHeader("content-type", "application/json");
   res.setHeader("access-control-allow-origin", "*");
@@ -10,5 +8,6 @@ export default async function handler(req: any, res: any) {
   }
   res.status(200).send(JSON.stringify({ ok: true, runtime: "node" }));
 }
+
 
 

@@ -74,10 +74,22 @@ export default async function handler(req: any, res: any) {
       })
     });
 
-    if (!r.ok) {
-      const detail = await r.text().catch(() => "<no body>");
-      return res.status(r.status).send(JSON.stringify({ error: "OpenAI error", detail }));
-    }
+if (!r.ok) {
+  const detail = await r.text().catch(() => "<no body>");
+  // Als quota op is, geef dummy terug i.p.v. error
+  if (detail.includes("insufficient_quota")) {
+    return res.status(200).send(JSON.stringify({
+      model: "dummy",
+      suggestions: [
+        `Icebreaker over: ${prompt} (1)`,
+        `Icebreaker over: ${prompt} (2)`,
+        `Icebreaker over: ${prompt} (3)`
+      ],
+      note: "OpenAI quota op — dummy response"
+    }));
+  }
+  return res.status(r.status).send(JSON.stringify({ error: "OpenAI error", detail }));
+}
 
     const data = await r.json().catch(() => ({}));
     const text: string = data?.choices?.[0]?.message?.content ?? "";

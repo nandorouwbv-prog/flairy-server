@@ -1,13 +1,31 @@
 // api/simulator.ts
 export const config = { runtime: "edge" };
 
+import {
+  normalizeLang,
+  normalizeTone,
+  normalizePersona,
+  personaHint,
+  toneHint,
+  looksEnglish,
+} from "../lib/promtHelpers";
+
 type Msg = { role: "user" | "ai"; text: string };
+
 type Body = {
-  history?: Msg[];        // laatste berichten
-  user?: string;          // huidige invoer
+  history?: Msg[];
+  user?: string;
+
   tone?: "safe" | "playful" | "flirty" | string;
   persona?: "funny" | "classy" | "wing" | "wingwoman" | string;
   language?: "nl" | "en" | string;
+
+  name?: string;
+  intent?: string;
+  interests?: string[];
+  shortHistory?: string;
+  turn?: number;     // 1-based; 3,6,9... => Coach
+  model?: string;
 };
 
 function json(data: any, status = 200) {
@@ -17,26 +35,14 @@ function json(data: any, status = 200) {
       "content-type": "application/json",
       "access-control-allow-origin": "*",
       "access-control-allow-methods": "GET,POST,OPTIONS",
-      "access-control-allow-headers": "content-type,authorization"
-    }
+      "access-control-allow-headers": "content-type,authorization",
+      "cache-control": "no-store",
+    },
   });
 }
 
-function normalizeLang(l?: string): "nl" | "en" {
-  return (l || "nl").toLowerCase().startsWith("en") ? "en" : "nl";
-}
-function normalizeTone(t?: string): "safe" | "playful" | "flirty" {
-  const v = (t || "safe").toLowerCase();
-  if (v === "playful") return "playful";
-  if (v === "flirty" || v === "flirt" || v === "flirterig") return "flirty";
-  return "safe";
-}
-function normalizePersona(p?: string) {
-  const v = (p || "").toLowerCase();
-  if (v === "wingwoman" || v === "wingman") return "wing";
-  if (v === "funny" || v === "classy" || v === "wing") return v;
-  return undefined;
-}
+const clean = (s: string) =>
+  String(s || "").replace(/^[\s"“”]+/, "").replace(/["“”]+$/, "").trim();
 
 export default async function handler(req: Request) {
   if (req.method === "OPTIONS") return json({}, 200);
@@ -45,84 +51,161 @@ export default async function handler(req: Request) {
   const hasOpenAI = !!process.env.OPENAI_API_KEY;
 
   if (req.method === "GET") {
-    return json({ ok: true, rid, hint: "POST { history?: [{role,text}], user, tone?, persona?, language? }" });
+    return json({
+      ok: true,
+      rid,
+      hint:
+        "POST { history?: [{role:'user'|'ai',text}], user, tone?, persona?, language?, name?, intent?, interests?, shortHistory?, turn? }",
+    });
   }
   if (req.method !== "POST") return json({ error: "Method Not Allowed" }, 405);
 
   try {
     const b = (await req.json().catch(() => ({}))) as Body;
+
     const lang = normalizeLang(b.language);
     const tone = normalizeTone(b.tone);
     const persona = normalizePersona(b.persona);
 
-    const history = Array.isArray(b.history) ? b.history.slice(-6) : [];
+    const history: Msg[] = Array.isArray(b.history) ? b.history.slice(-6) : [];
     const user = (b.user || "").toString().trim();
 
     if (!user && history.length === 0) {
-      return json({ error: "missing_input", message: "Provide { user } or { history }" }, 400);
+      return json(
+        { error: "missing_input", message: "Provide { user } or { history }" },
+        400
+      );
     }
 
-    const personaHint =
-      persona === "funny"
-        ? (lang === "en" ? "Use light humor." : "Gebruik luchtige humor.")
-        : persona === "classy"
-        ? (lang === "en" ? "Elegant and confident." : "Elegant en zelfverzekerd.")
-        : persona === "wing"
-        ? (lang === "en" ? "Socially smart and supportive." : "Sociaal slim en ondersteunend.")
-        : (lang === "en" ? "Natural and friendly." : "Natuurlijk en vriendelijk.");
+    const name = (b.name || "").toString().trim();
+    const intent = (b.intent || "").toString().trim();
+    const interests = Array.isArray(b.interests) ? b.interests : [];
+    const shortHistory = (b.shortHistory || "").toString().trim();
 
-    const toneHint =
-      tone === "flirty"
-        ? (lang === "en" ? "Flirty but respectful." : "Flirterig maar respectvol.")
-        : tone === "playful"
-        ? (lang === "en" ? "Playful and positive." : "Speels en positief.")
-        : (lang === "en" ? "Safe and friendly." : "Veilig en vriendelijk.");
+    // ---------------- Server-fallback voor turn ----------------
+    // Client mag 'turn' meesturen (1,2,3,...) => 3,6,9 krijgen coach tips.
+    // Als 'turn' ontbreekt of ongeldig is, berekenen we 'nextAiTurn' uit de history:
+    // tel AI-berichten in history (inclusief greeting), maar trek de greeting af.
+    const rawTurn =
+      typeof b.turn === "number" && Number.isFinite(b.turn) ? Number(b.turn) : undefined;
 
-    // Build compact context
+    let nextAiTurn: number;
+    if (typeof rawTurn === "number") {
+      nextAiTurn = Math.max(1, rawTurn);
+    } else {
+      const aiCount = history.filter((m) => m.role === "ai").length; // bevat greeting
+      nextAiTurn = Math.max(0, aiCount - 1) + 1; // 1,2,3,... zonder greeting
+    }
+
+    const mustCoach = nextAiTurn % 3 === 0;
+    // ----------------------------------------------------------
+
+    const pHint = personaHint(lang, persona);
+    const tHint = toneHint(lang, tone);
+
     const ctx =
       history
-        .map((m) => `${m.role === "user" ? (lang === "en" ? "User" : "Gebruiker") : (lang === "en" ? "You" : "Jij")}: ${m.text}`)
-        .join("\n") + (user ? `\n${lang === "en" ? "User" : "Gebruiker"}: ${user}` : "");
+        .map((m) =>
+          `${
+            m.role === "user" ? (lang === "nl" ? "Gebruiker" : "User") : lang === "nl" ? "Jij" : "You"
+          }: ${m.text}`
+        )
+        .join("\n") +
+      (user ? `\n${lang === "nl" ? "Gebruiker" : "User"}: ${user}` : "");
 
     if (!hasOpenAI) {
+      // Dummy pad voor lokale/dev zonder key
       const reply =
-        lang === "en"
-          ? "Haha, that’s cute. Tell me more 😉"
-          : "Haha, leuk! Vertel eens meer 😉";
-      console.log(`[simulator:${rid}] dummy`, { lang, tone, persona });
-      return json({
-        model: "dummy",
-        reply,
-        style: tone,
-        why: persona ? `Persona ${persona}, tone ${tone}` : `Tone ${tone}`,
-        rid
+        lang === "nl"
+          ? "Klinkt leuk—wat vind je van sushi?"
+          : "Sounds fun—what do you think about sushi?";
+      const micro_topic = "eten";
+      const coach = mustCoach
+        ? [
+            lang === "nl"
+              ? "Maak het concreet: stel een kleine keuzevraag."
+              : "Be specific: ask a small either-or.",
+            lang === "nl"
+              ? "Haak aan op een nieuw micro-onderwerp voor variatie."
+              : "Introduce a small new topic to vary.",
+          ]
+        : undefined;
+      console.log(`[simulator:${rid}] dummy`, {
+        lang,
+        tone,
+        persona,
+        mustCoach,
+        nextAiTurn,
       });
+      return json({ model: "dummy", reply, micro_topic, coach, style: tone, rid });
     }
 
-    const system =
-      lang === "en"
-        ? "You simulate a realistic dating-app match. Reply in 1–2 sentences, natural, no emojis overkill, no explicit content."
-        : "Je simuleert een realistische dating-app match. Antwoord in 1–2 zinnen, natuurlijk, geen emoji-overdaad, geen expliciete inhoud.";
+    const model = b.model || process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-    const prompt =
-      lang === "en"
-        ? `${personaHint} ${toneHint}\nContext:\n${ctx}\nReply as my match now:`
-        : `${personaHint} ${toneHint}\nContext:\n${ctx}\nAntwoord nu als mijn match:`;
+    // ————— System prompt —————
+    const system = `
+Je bent Flairy, een empathische dating coach en chatsimulatie-partner.
+Regels:
+- Antwoord kort (1–2 zinnen) als "match", spreektaal, speels en concreet.
+- Breng ELKE beurt minstens 1 subtiel nieuw micro-onderwerp in (hobby, film, trip, muziek, eten, sport, werk, huisdier).
+- Vermijd exact dezelfde opener of zinstructuur als eerder in dit gesprek.
+- ${mustCoach ? "SLUIT AF met een coachingblok:" : "Geen coachingblok in deze beurt."}
+  "Coach 👇"
+  - 2–3 ultrakorte tips (bullet points) over toon, concreetheid of vraagstelling.
+- Taal = ${lang}.
+- Persona = ${persona}. Toon = ${tone}.
+Geef ALTIJD JSON-antwoord met keys: "reply" (string), "micro_topic" (string)${
+      mustCoach ? ', "coach" (string[])' : ""
+    }.
+`.trim();
 
+    // ————— User prompt —————
+    const userPrompt = `
+${pHint} ${tHint}
+
+Mijn context:
+- Naam: ${name || "-"}
+- Intentie: ${intent || "-"}
+- Interesses: ${(interests || []).join(", ") || "-"}
+
+Vorige beurten (kort):
+${shortHistory || "-"}
+
+Context (recent transcript):
+${ctx}
+
+Doel:
+- Reageer als "match" in 1–2 zinnen.
+- Introduceer 1 nieuw micro-onderwerp.
+${mustCoach ? "- Voeg ook Coach 👇 toe met 2–3 bullets." : "- Geen Coach-blok deze beurt."}
+
+Beoogd JSON:
+{
+  "reply": "1–2 zinnen",
+  "micro_topic": "nieuw micro-onderwerp"${
+    mustCoach ? `,\n  "coach": ["tip1","tip2"]` : ""
+  }
+}
+`.trim();
+
+    // 1) hoofd-call
     const r = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        authorization: `Bearer ${process.env.OPENAI_API_KEY!}`
+        authorization: `Bearer ${process.env.OPENAI_API_KEY!}`,
       },
       body: JSON.stringify({
-        model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-        temperature: 0.8,
+        model,
+        temperature: 0.7,
+        presence_penalty: 0.6,
+        frequency_penalty: 0.3,
+        response_format: { type: "json_object" },
         messages: [
           { role: "system", content: system },
-          { role: "user", content: prompt }
-        ]
-      })
+          { role: "user", content: userPrompt },
+        ],
+      }),
     });
 
     if (!r.ok) {
@@ -130,19 +213,64 @@ export default async function handler(req: Request) {
       console.log(`[simulator:${rid}] openai_error`, r.status, detail.slice(0, 200));
       if (detail.includes("insufficient_quota")) {
         const reply =
-          lang === "en"
-            ? "I glitched for a sec. Try again?"
-            : "Ik had even een hikje. Probeer het nog eens?";
-        return json({ model: "dummy", reply, style: tone, note: "OpenAI quota", rid });
+          lang === "nl"
+            ? "Ik had even een hikje. Probeer het nog eens?"
+            : "I glitched for a sec. Try again?";
+        return json(
+          { model: "dummy", reply, micro_topic: "small talk", note: "OpenAI quota", rid },
+          200
+        );
       }
       return json({ error: "openai_error", detail, rid }, r.status);
     }
 
     const data = await r.json().catch(() => ({} as any));
-    const reply: string = (data?.choices?.[0]?.message?.content || "").trim();
+    let parsed: { reply?: string; micro_topic?: string; coach?: string[] } = {};
+    try {
+      parsed = JSON.parse(data?.choices?.[0]?.message?.content ?? "{}");
+    } catch {
+      parsed = { reply: clean(data?.choices?.[0]?.message?.content ?? "") };
+    }
 
-    console.log(`[simulator:${rid}] ok`, { lang, tone, persona, hasHistory: history.length > 0 });
-    return json({ model: "gpt-4o-mini", reply, style: tone, rid });
+    let reply = clean(parsed?.reply ?? "");
+    const micro_topic = clean(parsed?.micro_topic ?? "");
+    let coach = Array.isArray(parsed?.coach) ? parsed.coach.slice(0, 3) : undefined;
+
+    // 2) NL fallback-vertaling
+    if (lang === "nl" && looksEnglish(reply)) {
+      const r2 = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${process.env.OPENAI_API_KEY!}`,
+        },
+        body: JSON.stringify({
+          model,
+          temperature: 0,
+          messages: [
+            {
+              role: "system",
+              content:
+                "Vertaal naar natuurlijk Nederlands, kort (max 30 woorden). Geef alleen de zin(nen), zonder aanhalingstekens.",
+            },
+            { role: "user", content: reply },
+          ],
+        }),
+      });
+      const d2 = await r2.json().catch(() => ({}));
+      reply = clean(d2?.choices?.[0]?.message?.content ?? reply);
+    }
+
+    console.log(`[simulator:${rid}] ok`, {
+      lang,
+      tone,
+      persona,
+      hasHistory: history.length > 0,
+      mustCoach,
+      nextAiTurn,
+    });
+
+    return json({ model, reply, micro_topic, coach, style: tone, rid }, 200);
   } catch (e: any) {
     console.log(`[simulator] server_error`, String(e));
     return json({ error: "server_error", detail: String(e) }, 500);

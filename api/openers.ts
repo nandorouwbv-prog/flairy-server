@@ -1,6 +1,20 @@
 // api/openers.ts
 export const config = { runtime: "edge" };
 
+import {
+  normalizeLang,
+  normalizeTone,
+  normalizePersona,
+  systemFor,
+  personaHint,
+  toneHint,
+  jsonListSchema,
+  stripLines,
+  uniq5,
+  looksEnglish,
+  formatRepairSystem,
+} from "../lib/promtHelpers";
+
 type Body = {
   name?: string;
   interests?: string;
@@ -16,39 +30,9 @@ function json(data: any, status = 200) {
       "content-type": "application/json",
       "access-control-allow-origin": "*",
       "access-control-allow-methods": "GET,POST,OPTIONS",
-      "access-control-allow-headers": "content-type,authorization"
-    }
+      "access-control-allow-headers": "content-type,authorization",
+    },
   });
-}
-
-function normalizeLang(l?: string): "nl" | "en" {
-  const v = (l || "nl").toLowerCase();
-  return v.startsWith("en") ? "en" : "nl";
-}
-function normalizeTone(t?: string): "safe" | "playful" | "flirty" {
-  const v = (t || "safe").toLowerCase();
-  if (v === "playful") return "playful";
-  if (v === "flirty" || v === "flirt" || v === "flirterig") return "flirty";
-  return "safe";
-}
-function normalizePersona(p?: string) {
-  const v = (p || "").toLowerCase();
-  if (v === "wingwoman" || v === "wingman") return "wing";
-  if (v === "funny" || v === "classy" || v === "wing") return v;
-  return undefined;
-}
-
-function toObjects(lines: string[], style: "safe" | "playful" | "flirty", why: string) {
-  return lines
-    .map((s) => s.replace(/^[\-\*\d\.\s]+/, "").trim())
-    .filter(Boolean)
-    .slice(0, 5)
-    .map((text, i) => ({
-      id: `opener_${i + 1}`,
-      text,
-      style,
-      why
-    }));
 }
 
 export default async function handler(req: Request) {
@@ -58,7 +42,11 @@ export default async function handler(req: Request) {
   const hasOpenAI = !!process.env.OPENAI_API_KEY;
 
   if (req.method === "GET") {
-    return json({ ok: true, rid, hint: "POST { name?, interests?, tone?, persona?, language? }" });
+    return json({
+      ok: true,
+      rid,
+      hint: "POST { name?, interests?, tone?, persona?, language? }",
+    });
   }
   if (req.method !== "POST") return json({ error: "Method Not Allowed" }, 405);
 
@@ -71,88 +59,134 @@ export default async function handler(req: Request) {
     const name = (body.name || "").toString().trim();
     const interests = (body.interests || "").toString().trim();
 
-    const personaHint =
-      persona === "funny"
-        ? (lang === "en" ? "Use light humor." : "Gebruik luchtige humor.")
-        : persona === "classy"
-        ? (lang === "en" ? "Keep it elegant and confident." : "Houd het elegant en zelfverzekerd.")
-        : persona === "wing"
-        ? (lang === "en" ? "Be socially smart and supportive." : "Wees sociaal slim en ondersteunend.")
-        : (lang === "en" ? "Be natural." : "Blijf natuurlijk.");
-
-    const toneHint =
-      tone === "flirty"
-        ? (lang === "en" ? "Flirty but respectful." : "Flirterig maar respectvol.")
-        : tone === "playful"
-        ? (lang === "en" ? "Playful and positive." : "Speels en positief.")
-        : (lang === "en" ? "Safe and friendly." : "Veilig en vriendelijk.");
-
     if (!hasOpenAI) {
-      const why = persona ? `Persona ${persona}, tone ${tone}` : `Tone ${tone}`;
       const base = lang === "en" ? "Opener about" : "Openingszin over";
-      const dummy = toObjects(
-        [
-          `${base} ${name || "you"} ${interests ? `(${interests})` : ""} (1)`,
-          `${base} ${name || "you"} ${interests ? `(${interests})` : ""} (2)`,
-          `${base} ${name || "you"} ${interests ? `(${interests})` : ""} (3)`
-        ],
-        tone,
-        why
+      const lines = uniq5(
+        stripLines(
+          `${base} ${name || "jou"} ${interests ? `(${interests})` : ""} (1)\n(2)\n(3)\n(4)\n(5)`,
+        ),
       );
+      const suggestions = lines.map((text, i) => ({
+        id: `opener_${i + 1}`,
+        text,
+        style: tone,
+        why: persona ? `Persona ${persona}, tone ${tone}` : `Tone ${tone}`,
+      }));
       console.log(`[openers:${rid}] dummy`, { lang, tone, persona });
-      return json({ model: "dummy", suggestions: dummy, note: "OPENAI_API_KEY missing", rid });
+      return json({ model: "dummy", suggestions, rid }, 200);
     }
 
-    const prompt =
-      lang === "en"
-        ? `Generate 5 original dating app opener lines.\n${personaHint} ${toneHint}\nUser details: name=${name || "-"}, interests=${interests || "-"}.\nKeep each line short, natural, non-cringy. Return only the lines separated by newlines.`
-        : `Genereer 5 originele openingszinnen voor een dating app.\n${personaHint} ${toneHint}\nGebruikersdetails: naam=${name || "-"}, interesses=${interests || "-"}.\nHoud elke zin kort, natuurlijk en niet cringe. Geef alleen de zinnen, gescheiden door nieuwe regels.`;
+    const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+    // 1) hoofd-call met JSON afdwingen
+    const sys = systemFor(lang, "list5");
+    const usr =
+      `${personaHint(lang, persona)} ${toneHint(lang, tone)}\n` +
+      `Name: ${name || "-"}\nInterests: ${interests || "-"}\n` +
+      `Context: openingszinnen voor een dating app.\n` +
+      jsonListSchema(tone);
 
     const r = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        authorization: `Bearer ${process.env.OPENAI_API_KEY!}`
+        authorization: `Bearer ${process.env.OPENAI_API_KEY!}`,
       },
       body: JSON.stringify({
-        model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-        temperature: 0.8,
+        model,
+        temperature: 0.7,
+        response_format: { type: "json_object" },
         messages: [
-          { role: "system", content: "You craft concise, high-quality dating openers." },
-          { role: "user", content: prompt }
-        ]
-      })
+          { role: "system", content: sys },
+          { role: "user", content: usr },
+        ],
+      }),
     });
 
     if (!r.ok) {
       const detail = await r.text().catch(() => "<no body>");
       console.log(`[openers:${rid}] openai_error`, r.status, detail.slice(0, 200));
       if (detail.includes("insufficient_quota")) {
-        const why = `Quota exhausted — returning dummy (${tone})`;
-        const dummy = toObjects(
-          [
-            `Openingszin over ${name || "jou"} ${interests ? `(${interests})` : ""} (1)`,
-            `Openingszin over ${name || "jou"} ${interests ? `(${interests})` : ""} (2)`,
-            `Openingszin over ${name || "jou"} ${interests ? `(${interests})` : ""} (3)`
-          ],
-          tone,
-          why
+        const lines = uniq5(
+          stripLines(
+            `Openingszin over ${name || "jou"} ${interests ? `(${interests})` : ""} (1)\n(2)\n(3)\n(4)\n(5)`,
+          ),
         );
-        return json({ model: "dummy", suggestions: dummy, note: "OpenAI quota", rid });
+        const suggestions = lines.map((text, i) => ({
+          id: `opener_${i + 1}`,
+          text,
+          style: tone,
+          why: `Quota exhausted — fallback (${tone})`,
+        }));
+        return json({ model: "dummy", suggestions, note: "OpenAI quota", rid }, 200);
       }
       return json({ error: "openai_error", detail, rid }, r.status);
     }
 
     const data = await r.json().catch(() => ({} as any));
-    const text: string = data?.choices?.[0]?.message?.content ?? "";
-    const lines = text.split("\n");
-    const why = persona ? `Persona ${persona}, tone ${tone}` : `Tone ${tone}`;
-    const suggestions = toObjects(lines, tone, why);
+    let out: string = data?.choices?.[0]?.message?.content ?? "";
 
-    console.log(`[openers:${rid}] ok`, { lang, tone, persona, count: suggestions.length });
-    return json({ model: "gpt-4o-mini", suggestions, rid });
+    // Probeer JSON te parsen
+    type Sug = { text: string; style?: string; why?: string };
+    let suggestions: Sug[] = [];
+    try {
+      const parsed = JSON.parse(out);
+      if (Array.isArray(parsed?.suggestions)) suggestions = parsed.suggestions;
+    } catch {}
+
+    // Fallback: text → NL-vertaling indien Engels → strip/uniq
+    if (!suggestions.length) {
+      if (lang === "nl" && looksEnglish(out)) {
+        const r2 = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${process.env.OPENAI_API_KEY!}` },
+          body: JSON.stringify({
+            model, temperature: 0,
+            messages: [
+              { role: "system", content: "Vertaal naar natuurlijk Nederlands. Geef 5 losse zinnen, zonder nummering of aanhalingstekens." },
+              { role: "user", content: out },
+            ],
+          }),
+        });
+        const d2 = await r2.json().catch(() => ({}));
+        out = d2?.choices?.[0]?.message?.content ?? out;
+      }
+      const lines = uniq5(stripLines(out));
+      suggestions = lines.map((t) => ({ text: t, style: tone }));
+    }
+
+    // Format-repair naar EXACT 5 indien nodig
+    if (suggestions.length !== 5) {
+      const fmt = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${process.env.OPENAI_API_KEY!}` },
+        body: JSON.stringify({
+          model, temperature: 0.2,
+          messages: [
+            { role: "system", content: formatRepairSystem(lang, tone) },
+            { role: "user", content: suggestions.map((s) => s.text).join("\n") || out },
+          ],
+        }),
+      });
+      const fmtData = await fmt.json().catch(() => ({}));
+      const fixed = fmtData?.choices?.[0]?.message?.content ?? out;
+      const lines = uniq5(stripLines(fixed));
+      suggestions = lines.map((t) => ({ text: t, style: tone }));
+    }
+
+    // cap en why invullen
+    const final = suggestions.slice(0, 5).map((s, i) => ({
+      id: `opener_${i + 1}`,
+      text: s.text,
+      style: (s.style as any) || tone,
+      why: s.why || (persona ? `Persona ${persona}, tone ${tone}` : ""),
+    }));
+
+    console.log(`[openers:${rid}] ok`, { lang, tone, persona, count: final.length });
+    return json({ model, suggestions: final, rid }, 200);
   } catch (e: any) {
     console.log(`[openers] server_error`, String(e));
     return json({ error: "server_error", detail: String(e) }, 500);
   }
 }
+

@@ -1,4 +1,38 @@
-// Helper: lees body als string als Vercel het niet geparsed heeft
+// api/suggest.ts
+
+/* -------------------- Rate limit (in-memory) -------------------- */
+const rateLimitMap = new Map<string, { count: number; ts: number }>();
+const WINDOW_MS = 5_000;
+const MAX_REQ = 1;
+
+function getClientIp(req: any): string {
+  const xf = (req?.headers?.["x-forwarded-for"] as string) || "";
+  return xf.split(",")[0]?.trim() || req?.socket?.remoteAddress || "unknown";
+}
+function hitLimit(ip: string) {
+  const now = Date.now();
+  const row = rateLimitMap.get(ip);
+  if (!row) { rateLimitMap.set(ip, { count: 1, ts: now }); return false; }
+  if (now - row.ts < WINDOW_MS) { if (row.count >= MAX_REQ) return true; row.count += 1; return false; }
+  rateLimitMap.set(ip, { count: 1, ts: now }); return false;
+}
+
+/* -------------------- Helpers -------------------- */
+import {
+  normalizeLang,
+  normalizeTone,
+  normalizePersona,
+  systemFor,
+  personaHint,
+  toneHint,
+  jsonListSchema,
+  stripLines,
+  uniq5,
+  looksEnglish,
+  formatRepairSystem,
+} from "../lib/promtHelpers";
+
+
 function readBody(req: any): Promise<string> {
   return new Promise((resolve, reject) => {
     let data = "";
@@ -8,100 +42,174 @@ function readBody(req: any): Promise<string> {
   });
 }
 
+/* -------------------- Handler -------------------- */
 export default async function handler(req: any, res: any) {
   try {
+    // CORS
     res.setHeader("content-type", "application/json");
     res.setHeader("access-control-allow-origin", "*");
     res.setHeader("access-control-allow-methods", "GET,POST,OPTIONS");
     res.setHeader("access-control-allow-headers", "content-type,authorization");
     if (req.method === "OPTIONS") return res.status(200).send("{}");
 
-    const url = new URL(req.url || "", `https://${req.headers.host}`);
-
-    // Healthcheck (GET ?ping=1)
+    // Health
     if (req.method === "GET") {
-      if (url.searchParams.has("ping")) {
-        return res.status(200).send(JSON.stringify({ pong: true }));
-      }
-      return res.status(200).send(JSON.stringify({ ok: true, hint: "POST { prompt }" }));
+      return res.status(200).send(JSON.stringify({
+        ok: true,
+        model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+        hint: "POST { input|text|prompt, language?, persona?|coach?, tone?|flirtLevel? }"
+      }));
     }
-
     if (req.method !== "POST") {
       return res.status(405).send(JSON.stringify({ error: "Method not allowed" }));
     }
 
-    // Body-parsing: pak geparste body of lees de stream
-    let raw = "";
-    if (req.body && typeof req.body === "string") raw = req.body;
-    else if (req.body && typeof req.body === "object") raw = JSON.stringify(req.body);
-    else raw = await readBody(req);
-
-    let body: any = {};
-    try { body = raw ? JSON.parse(raw) : {}; } catch { /* laat body {} */ }
-
-    const prompt: string = (body?.prompt ?? "").toString().trim();
-    if (!prompt) return res.status(400).send(JSON.stringify({ error: "Missing 'prompt' in body" }));
-
-    const key: string | undefined = (globalThis as any)?.process?.env?.OPENAI_API_KEY;
-
-    // Fallback zonder key
-    if (!key) {
-      return res.status(200).send(JSON.stringify({
-        model: "dummy",
-        suggestions: [
-          `Icebreaker over: ${prompt} (1)`,
-          `Icebreaker over: ${prompt} (2)`,
-          `Icebreaker over: ${prompt} (3)`
-        ],
-        note: "OPENAI_API_KEY ontbreekt — dummy response"
+    // Rate limit
+    const ip = getClientIp(req);
+    if (hitLimit(ip)) {
+      return res.status(429).send(JSON.stringify({
+        error: "rate_limited",
+        message: "Too many requests, try again later.",
+        retryAfter: Math.ceil(WINDOW_MS / 1000),
       }));
     }
 
-    // Echte OpenAI-call
+    // Body
+    const raw = typeof req.body === "string"
+      ? req.body
+      : req.body && typeof req.body === "object"
+      ? JSON.stringify(req.body)
+      : await readBody(req);
+
+    let body: any = {};
+    try { body = raw ? JSON.parse(raw) : {}; } catch {}
+
+    // Extract
+    const rawTextCandidate = body?.input ?? body?.text ?? body?.prompt ?? body?.message ?? body?.content ?? "";
+    const input: string = String(rawTextCandidate ?? "").trim();
+    const language = normalizeLang(body?.language);
+    const persona = normalizePersona(body?.persona ?? body?.coach);
+    const tone = normalizeTone(body?.tone ?? body?.flirtLevel);
+
+    if (!input) {
+      return res.status(400).send(JSON.stringify({
+        error: "missing_input",
+        message: "Missing text: please send { input } or { text } or { prompt } as a non-empty string.",
+      }));
+    }
+
+    const key: string | undefined = process.env.OPENAI_API_KEY;
+    if (!key) {
+      const lines = uniq5(stripLines(`Openingsvariaties over: ${input} (1)\n(2)\n(3)\n(4)\n(5)`));
+      return res.status(200).send(JSON.stringify({
+        model: "dummy",
+        langEcho: language,
+        suggestions: lines.map((text) => ({ style: tone, text, why: persona ? `Persona ${persona}, tone ${tone}` : "" })),
+        note: "OPENAI_API_KEY missing",
+      }));
+    }
+
+    const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+    // 1) hoofd-call: JSON afdwingen
+    const sys = systemFor(language, "list5");
+    const usr =
+      `${personaHint(language, persona)} ${toneHint(language, tone)}\n` +
+      `Context: ${input}\n` +
+      jsonListSchema(tone);
+
     const r = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${key}`
-      },
+      headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
       body: JSON.stringify({
-        model: "gpt-4o-mini",
+        model,
+        temperature: 0.8,
+        response_format: { type: "json_object" },
         messages: [
-          { role: "system", content: "You generate short, catchy dating app openers. Return only bullet points." },
-          { role: "user", content: `Give 5 openers about: ${prompt}` }
+          { role: "system", content: sys },
+          { role: "user", content: usr },
         ],
-        temperature: 0.8
-      })
+      }),
     });
 
-if (!r.ok) {
-  const detail = await r.text().catch(() => "<no body>");
-  // Als quota op is, geef dummy terug i.p.v. error
-  if (detail.includes("insufficient_quota")) {
-    return res.status(200).send(JSON.stringify({
-      model: "dummy",
-      suggestions: [
-        `Icebreaker over: ${prompt} (1)`,
-        `Icebreaker over: ${prompt} (2)`,
-        `Icebreaker over: ${prompt} (3)`
-      ],
-      note: "OpenAI quota op — dummy response"
-    }));
-  }
-  return res.status(r.status).send(JSON.stringify({ error: "OpenAI error", detail }));
-}
+    if (!r.ok) {
+      const detail = await r.text().catch(() => "<no body>");
+      if (detail.includes("insufficient_quota")) {
+        const lines = uniq5(stripLines(`Openingsvariaties over: ${input} (1)\n(2)\n(3)\n(4)\n(5)`));
+        return res.status(200).send(JSON.stringify({
+          model: "dummy",
+          langEcho: language,
+          suggestions: lines.map((text) => ({ style: tone, text })),
+          note: "OpenAI quota",
+        }));
+      }
+      return res.status(r.status).send(JSON.stringify({ error: "openai_error", detail }));
+    }
 
     const data = await r.json().catch(() => ({}));
-    const text: string = data?.choices?.[0]?.message?.content ?? "";
-    const suggestions = text
-      .split("\n")
-      .map((s: string) => s.replace(/^[\-\*\d\.\s]+/, ""))
-      .filter((s: string) => s.trim())
-      .slice(0, 5);
+    let out = data?.choices?.[0]?.message?.content ?? "";
 
-    return res.status(200).send(JSON.stringify({ model: "gpt-4o-mini", suggestions }));
+    // probeer JSON te parsen
+    type Sug = { text: string; style?: string; why?: string };
+    let suggestions: Sug[] = [];
+    try {
+      const parsed = JSON.parse(out);
+      if (Array.isArray(parsed?.suggestions)) suggestions = parsed.suggestions;
+    } catch {}
+
+    // Fallback op text → strip/uniq (evt. vertalen als engels lekt)
+    if (!suggestions.length) {
+      if (language === "nl" && looksEnglish(out)) {
+        const r2 = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+          body: JSON.stringify({
+            model, temperature: 0,
+            messages: [
+              { role: "system", content: "Vertaal naar natuurlijk Nederlands. Geef 5 losse zinnen, zonder nummering of aanhalingstekens." },
+              { role: "user", content: out },
+            ],
+          }),
+        });
+        const d2 = await r2.json().catch(() => ({}));
+        out = d2?.choices?.[0]?.message?.content ?? out;
+      }
+      const lines = uniq5(stripLines(out));
+      suggestions = lines.map((t) => ({ text: t, style: tone }));
+    }
+
+    // Format-repair naar EXACT 5 indien nodig
+    if (suggestions.length !== 5) {
+      const fmt = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+        body: JSON.stringify({
+          model, temperature: 0.2,
+          messages: [
+            { role: "system", content: formatRepairSystem(language, tone) },
+            { role: "user", content: (suggestions.map((s) => s.text).join("\n") || out) },
+          ],
+        }),
+      });
+      const fmtData = await fmt.json().catch(() => ({}));
+      const fixed = fmtData?.choices?.[0]?.message?.content ?? out;
+      const lines = uniq5(stripLines(fixed));
+      suggestions = lines.map((t) => ({ text: t, style: tone }));
+    }
+
+    // cap → 5
+    suggestions = suggestions.slice(0, 5).map((s) => ({
+      text: s.text,
+      style: s.style || tone,
+      why: s.why || (persona ? `Persona ${persona}, tone ${tone}` : ""),
+    }));
+
+    return res.status(200).send(JSON.stringify({
+      model,
+      langEcho: language,
+      suggestions,
+    }));
   } catch (e: any) {
-    return res.status(500).send(JSON.stringify({ error: "Server error", detail: String(e) }));
+    return res.status(500).send(JSON.stringify({ error: "server_error", detail: String(e) }));
   }
 }
-

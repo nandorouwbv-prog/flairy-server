@@ -15,18 +15,36 @@ import {
   formatRepairSystem,
 } from "../lib/promtHelpers";
 
-
 type Body = {
   input?: string;
   text?: string;
   prompt?: string;
   message?: string;
   content?: string;
-  language?: "nl" | "en" | string;
+  language?: string;
   persona?: "funny" | "classy" | "wing" | "wingwoman" | string;
   tone?: "safe" | "playful" | "flirty" | string;
   flirtLevel?: "safe" | "playful" | "flirty" | string;
 };
+
+const languageName = (l: string) =>
+  ({
+    en: "English",
+    nl: "Dutch",
+    hi: "Hindi",
+    zh: "Simplified Chinese",
+    ar: "Arabic",
+    de: "German",
+    es: "Spanish",
+    fr: "French",
+    it: "Italian",
+    ja: "Japanese",
+    ko: "Korean",
+    pl: "Polish",
+    pt: "Portuguese",
+    ru: "Russian",
+    tr: "Turkish",
+  } as Record<string, string>)[l] || "English";
 
 function jsonResp(data: any, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -71,9 +89,13 @@ export default async function handler(req: Request) {
 
     // Geen key → dummy
     if (!key) {
-      const lines = uniq5(stripLines(language === "nl"
-        ? `Variaties op: ${input}\n(2)\n(3)\n(4)\n(5)`
-        : `Variations on: ${input}\n(2)\n(3)\n(4)\n(5)`));
+      const lines = uniq5(
+        stripLines(
+          language === "en"
+            ? `Variations on: ${input}\n(2)\n(3)\n(4)\n(5)`
+            : `Variaties op: ${input}\n(2)\n(3)\n(4)\n(5)`
+        )
+      );
       return jsonResp({
         model: "dummy",
         langEcho: language,
@@ -105,9 +127,13 @@ export default async function handler(req: Request) {
     if (!r.ok) {
       const detail = await r.text().catch(() => "<no body>");
       if (detail.includes("insufficient_quota")) {
-        const lines = uniq5(stripLines(language === "nl"
-          ? `Variaties op: ${input}\n(2)\n(3)\n(4)\n(5)`
-          : `Variations on: ${input}\n(2)\n(3)\n(4)\n(5)`));
+        const lines = uniq5(
+          stripLines(
+            language === "en"
+              ? `Variations on: ${input}\n(2)\n(3)\n(4)\n(5)`
+              : `Variaties op: ${input}\n(2)\n(3)\n(4)\n(5)`
+          )
+        );
         return jsonResp({
           model: "dummy",
           langEcho: language,
@@ -133,15 +159,21 @@ export default async function handler(req: Request) {
 
     // 3) Fallback als geen JSON: text → strip/uniq
     if (!suggestions.length) {
-      // NL fallback-vertaling als model toch Engels gaf
-      if (language === "nl" && looksEnglish(out)) {
+      // Universele vertaalfallback voor alle niet-EN talen
+      if (language !== "en" && looksEnglish(out)) {
         const r2 = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
           headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
           body: JSON.stringify({
-            model, temperature: 0,
+            model,
+            temperature: 0,
             messages: [
-              { role: "system", content: "Vertaal naar natuurlijk Nederlands. Geef 5 losse zinnen, zonder nummering of aanhalingstekens." },
+              {
+                role: "system",
+                content: `Translate to natural ${languageName(
+                  language
+                )}. Return 5 separate single-line suggestions, no numbering or quotes.`,
+              },
               { role: "user", content: out },
             ],
           }),
@@ -160,10 +192,11 @@ export default async function handler(req: Request) {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
         body: JSON.stringify({
-          model, temperature: 0.2,
+          model,
+          temperature: 0.2,
           messages: [
             { role: "system", content: formatRepairSystem(language, tone) },
-            { role: "user", content: (suggestions.map((s) => s.text).join("\n") || out) },
+            { role: "user", content: suggestions.map((s) => s.text).join("\n") || out },
           ],
         }),
       });

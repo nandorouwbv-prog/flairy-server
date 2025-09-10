@@ -19,7 +19,7 @@ function hitLimit(ip: string) {
 
 /* -------------------- Helpers -------------------- */
 import {
-  normalizeLang,
+  // normalizeLang,               // ❌ niet meer forceren naar en/nl
   normalizeTone,
   normalizePersona,
   systemFor,
@@ -31,7 +31,7 @@ import {
   looksEnglish,
   formatRepairSystem,
 } from "../lib/promtHelpers";
-
+import { languageNameFromCode, langForHelpers } from "../lib/lang";
 
 function readBody(req: any): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -57,7 +57,7 @@ export default async function handler(req: any, res: any) {
       return res.status(200).send(JSON.stringify({
         ok: true,
         model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-        hint: "POST { input|text|prompt, language?, persona?|coach?, tone?|flirtLevel? }"
+        hint: "POST { input|text|prompt, language?, persona?|coach?, tone?|flirtLevel?, emoji? }"
       }));
     }
     if (req.method !== "POST") {
@@ -87,9 +87,16 @@ export default async function handler(req: any, res: any) {
     // Extract
     const rawTextCandidate = body?.input ?? body?.text ?? body?.prompt ?? body?.message ?? body?.content ?? "";
     const input: string = String(rawTextCandidate ?? "").trim();
-    const language = normalizeLang(body?.language);
+
+    // ✅ volledige taalcode (bv. de, pt-BR, zh, tr)
+    const language: string = String(body?.language || "en").toLowerCase();
+
+    // ✅ helpers verwachten ("en" | "nl") → derive alleen hiervoor
+    const langForH: "en" | "nl" = langForHelpers(language);
+
     const persona = normalizePersona(body?.persona ?? body?.coach);
     const tone = normalizeTone(body?.tone ?? body?.flirtLevel);
+    const emoji: boolean | undefined = body?.emoji;
 
     if (!input) {
       return res.status(400).send(JSON.stringify({
@@ -100,7 +107,13 @@ export default async function handler(req: any, res: any) {
 
     const key: string | undefined = process.env.OPENAI_API_KEY;
     if (!key) {
-      const lines = uniq5(stripLines(`Openingsvariaties over: ${input} (1)\n(2)\n(3)\n(4)\n(5)`));
+      const lines = uniq5(
+        stripLines(
+          language.startsWith("en")
+            ? `Short replies for: ${input}\n(2)\n(3)\n(4)\n(5)`
+            : `Korte reacties voor: ${input}\n(2)\n(3)\n(4)\n(5)`
+        )
+      );
       return res.status(200).send(JSON.stringify({
         model: "dummy",
         langEcho: language,
@@ -111,10 +124,12 @@ export default async function handler(req: any, res: any) {
 
     const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-    // 1) hoofd-call: JSON afdwingen
-    const sys = systemFor(language, "list5");
+    // 1) hoofd-call: JSON afdwingen — helpers op (en|nl), prompt noemt voluit taalnaam
+    const target = languageNameFromCode(language);
+    const sys = systemFor(langForH, "list5") + (emoji === false ? "\nDo not use emojis." : "");
     const usr =
-      `${personaHint(language, persona)} ${toneHint(language, tone)}\n` +
+      `${personaHint(langForH, persona)} ${toneHint(langForH, tone)}\n` +
+      `Write all outputs in: ${target}.\n` +
       `Context: ${input}\n` +
       jsonListSchema(tone);
 
@@ -135,7 +150,13 @@ export default async function handler(req: any, res: any) {
     if (!r.ok) {
       const detail = await r.text().catch(() => "<no body>");
       if (detail.includes("insufficient_quota")) {
-        const lines = uniq5(stripLines(`Openingsvariaties over: ${input} (1)\n(2)\n(3)\n(4)\n(5)`));
+        const lines = uniq5(
+          stripLines(
+            language.startsWith("en")
+              ? `Short replies for: ${input}\n(2)\n(3)\n(4)\n(5)`
+              : `Korte reacties voor: ${input}\n(2)\n(3)\n(4)\n(5)`
+          )
+        );
         return res.status(200).send(JSON.stringify({
           model: "dummy",
           langEcho: language,
@@ -157,16 +178,19 @@ export default async function handler(req: any, res: any) {
       if (Array.isArray(parsed?.suggestions)) suggestions = parsed.suggestions;
     } catch {}
 
-    // Fallback op text → strip/uniq (evt. vertalen als engels lekt)
+    // Fallback op text → strip/uniq (universele vertaalfallback)
     if (!suggestions.length) {
-      if (language === "nl" && looksEnglish(out)) {
+      if (!language.startsWith("en") && looksEnglish(out)) {
         const r2 = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
           headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
           body: JSON.stringify({
             model, temperature: 0,
             messages: [
-              { role: "system", content: "Vertaal naar natuurlijk Nederlands. Geef 5 losse zinnen, zonder nummering of aanhalingstekens." },
+              {
+                role: "system",
+                content: `Translate to natural ${languageNameFromCode(language)}. Return 5 separate single-line suggestions, no numbering or quotes.`,
+              },
               { role: "user", content: out },
             ],
           }),
@@ -178,7 +202,7 @@ export default async function handler(req: any, res: any) {
       suggestions = lines.map((t) => ({ text: t, style: tone }));
     }
 
-    // Format-repair naar EXACT 5 indien nodig
+    // Format-repair naar EXACT 5 indien nodig — helpers op (en|nl)
     if (suggestions.length !== 5) {
       const fmt = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
@@ -186,7 +210,7 @@ export default async function handler(req: any, res: any) {
         body: JSON.stringify({
           model, temperature: 0.2,
           messages: [
-            { role: "system", content: formatRepairSystem(language, tone) },
+            { role: "system", content: formatRepairSystem(langForH, tone) },
             { role: "user", content: (suggestions.map((s) => s.text).join("\n") || out) },
           ],
         }),

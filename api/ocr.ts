@@ -1,10 +1,12 @@
 // api/ocr.ts — OpenAI Vision primary, OCR.space fallback (Edge) + optional last-question reply
 export const config = { runtime: "edge" };
 
+import { languageNameFromCode } from "../lib/lang"; // ✅ nieuw
+
 type Body = {
   imageBase64?: string;
   image?: string;
-  language?: string; // 'nl' | 'en'
+  language?: string; // ✅ any BCP-47-ish code (e.g. 'de', 'pt-BR', 'zh', 'nl')
   debug?: boolean;
 
   // Nieuw: optionele reply-generator op basis van de laatste vraag
@@ -40,8 +42,9 @@ function toDataUrl(b64orDataUrl: string) {
   return `data:image/png;base64,${trimmed}`;
 }
 
-function normalizeLang(lang?: string): "nl" | "en" {
-  const v = (lang ?? "en").toLowerCase();
+// ✅ Only for OCR engines that support limited langs we collapse to en/nl
+function langForOCR(full?: string): "nl" | "en" {
+  const v = String(full || "en").toLowerCase();
   return v.startsWith("nl") ? "nl" : "en";
 }
 
@@ -69,7 +72,7 @@ function extractLastQuestion(text: string) {
 
 async function generateReplyForLastQuestion(params: {
   ocrText: string;
-  language: "nl" | "en";
+  language: string; // ✅ full code used for generation
   coachPersona?: string;
   tone?: string;
   shortContext?: string;
@@ -80,13 +83,16 @@ async function generateReplyForLastQuestion(params: {
   const model = params.model || "gpt-4o-mini";
   const lastQuestion = extractLastQuestion(ocrText);
 
+  // ✅ gebruik nette taalnaam voor het model
+  const target = languageNameFromCode(language);
+
   const system = `
 Je bent Flairy. Geef een direct antwoord op de LAATSTE vraag van de ander.
 Regels:
 - Antwoord kort en duidelijk, 1–2 zinnen.
 - Geef daarna 2 alternatieven met andere invalshoek (speels vs direct vs nieuwsgierig).
 - Sluit af met "Coach 👇" en 2 bullets (waarom dit werkt).
-- Taal = ${language}. Persona = ${coachPersona}. Toon = ${tone}.
+- Taal = ${target}. Persona = ${coachPersona}. Toon = ${tone}.
 Output JSON: { "direct": "...", "alt1": "...", "alt2": "...", "coach": ["tip1","tip2"] }.
 `.trim();
 
@@ -226,7 +232,7 @@ export default async function handler(req: Request) {
       {
         ok: true,
         hint:
-          "POST { imageBase64|image, language?: 'nl'|'en', debug?: true, " +
+          "POST { imageBase64|image, language?: string, debug?: true, " +
           "answerLastQuestion?: true, coachPersona?, tone?, shortContext?, model? }",
         visionModel: process.env.OPENAI_VISION_MODEL || "gpt-4o-mini",
       },
@@ -247,7 +253,10 @@ export default async function handler(req: Request) {
       );
     }
 
-    const lang = normalizeLang(body.language);
+    // ✅ Full language passthrough + derived lang for OCR engines
+    const languageFull = String(body.language || "en").toLowerCase();
+    const lang = langForOCR(languageFull); // only for OCR engines & simple prompts
+
     const dataUrl = toDataUrl(rawImage);
     const base64Len =
       dataUrl.startsWith("data:image/")
@@ -333,6 +342,7 @@ export default async function handler(req: Request) {
       model: modelUsed,
       engine: engineUsed,
       text,
+      langEcho: languageFull,
       debug: body.debug ? { base64Len } : undefined,
     };
 
@@ -346,7 +356,7 @@ export default async function handler(req: Request) {
       }
       const reply = await generateReplyForLastQuestion({
         ocrText: text,
-        language: lang,
+        language: languageFull, // ✅ full code for generation (inside we convert to name)
         coachPersona: body.coachPersona || "wing",
         tone: body.tone || "playful",
         shortContext: body.shortContext || "",

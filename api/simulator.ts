@@ -2,13 +2,13 @@
 export const config = { runtime: "edge" };
 
 import {
-  normalizeLang,
+  // normalizeLang, // ❌ niet meer forceren naar en/nl
   normalizeTone,
   normalizePersona,
   personaHint,
   toneHint,
-  looksEnglish,
 } from "../lib/promtHelpers";
+import { languageNameFromCode, langForHelpers } from "../lib/lang";
 
 type Msg = { role: "user" | "ai"; text: string };
 
@@ -18,13 +18,13 @@ type Body = {
 
   tone?: "safe" | "playful" | "flirty" | string;
   persona?: "funny" | "classy" | "wing" | "wingwoman" | string;
-  language?: "nl" | "en" | string;
+  language?: string; // ✅ full code accepted
 
   name?: string;
   intent?: string;
   interests?: string[];
   shortHistory?: string;
-  turn?: number;     // 1-based; 3,6,9... => Coach
+  turn?: number;
   model?: string;
 };
 
@@ -63,7 +63,11 @@ export default async function handler(req: Request) {
   try {
     const b = (await req.json().catch(() => ({}))) as Body;
 
-    const lang = normalizeLang(b.language);
+    // ✅ full code passthrough + en|nl for helpers
+    const language = String(b.language || "en").toLowerCase();
+    const langForH: "en" | "nl" = langForHelpers(language);      // helpers
+    const target = languageNameFromCode(language);                // mooie taalnaam
+
     const tone = normalizeTone(b.tone);
     const persona = normalizePersona(b.persona);
 
@@ -82,10 +86,6 @@ export default async function handler(req: Request) {
     const interests = Array.isArray(b.interests) ? b.interests : [];
     const shortHistory = (b.shortHistory || "").toString().trim();
 
-    // ---------------- Server-fallback voor turn ----------------
-    // Client mag 'turn' meesturen (1,2,3,...) => 3,6,9 krijgen coach tips.
-    // Als 'turn' ontbreekt of ongeldig is, berekenen we 'nextAiTurn' uit de history:
-    // tel AI-berichten in history (inclusief greeting), maar trek de greeting af.
     const rawTurn =
       typeof b.turn === "number" && Number.isFinite(b.turn) ? Number(b.turn) : undefined;
 
@@ -93,45 +93,48 @@ export default async function handler(req: Request) {
     if (typeof rawTurn === "number") {
       nextAiTurn = Math.max(1, rawTurn);
     } else {
-      const aiCount = history.filter((m) => m.role === "ai").length; // bevat greeting
-      nextAiTurn = Math.max(0, aiCount - 1) + 1; // 1,2,3,... zonder greeting
+      const aiCount = history.filter((m) => m.role === "ai").length;
+      nextAiTurn = Math.max(0, aiCount - 1) + 1;
     }
 
     const mustCoach = nextAiTurn % 3 === 0;
-    // ----------------------------------------------------------
 
-    const pHint = personaHint(lang, persona);
-    const tHint = toneHint(lang, tone);
+    // ✅ hints gevoed met en|nl helper-lang
+    const pHint = personaHint(langForH, persona);
+    const tHint = toneHint(langForH, tone);
 
     const ctx =
       history
         .map((m) =>
           `${
-            m.role === "user" ? (lang === "nl" ? "Gebruiker" : "User") : lang === "nl" ? "Jij" : "You"
+            m.role === "user"
+              ? (language.startsWith("nl") ? "Gebruiker" : "User")
+              : language.startsWith("nl")
+              ? "Jij"
+              : "You"
           }: ${m.text}`
         )
         .join("\n") +
-      (user ? `\n${lang === "nl" ? "Gebruiker" : "User"}: ${user}` : "");
+      (user ? `\n${language.startsWith("nl") ? "Gebruiker" : "User"}: ${user}` : "");
 
     if (!hasOpenAI) {
-      // Dummy pad voor lokale/dev zonder key
       const reply =
-        lang === "nl"
+        language.startsWith("nl")
           ? "Klinkt leuk—wat vind je van sushi?"
           : "Sounds fun—what do you think about sushi?";
-      const micro_topic = "eten";
+      const micro_topic = language.startsWith("nl") ? "eten" : "food";
       const coach = mustCoach
         ? [
-            lang === "nl"
+            language.startsWith("nl")
               ? "Maak het concreet: stel een kleine keuzevraag."
               : "Be specific: ask a small either-or.",
-            lang === "nl"
+            language.startsWith("nl")
               ? "Haak aan op een nieuw micro-onderwerp voor variatie."
               : "Introduce a small new topic to vary.",
           ]
         : undefined;
       console.log(`[simulator:${rid}] dummy`, {
-        lang,
+        language,
         tone,
         persona,
         mustCoach,
@@ -152,7 +155,7 @@ Regels:
 - ${mustCoach ? "SLUIT AF met een coachingblok:" : "Geen coachingblok in deze beurt."}
   "Coach 👇"
   - 2–3 ultrakorte tips (bullet points) over toon, concreetheid of vraagstelling.
-- Taal = ${lang}.
+- Taal = ${target}. Gebruik uitsluitend ${target}. Geen mengtaal.
 - Persona = ${persona}. Toon = ${tone}.
 Geef ALTIJD JSON-antwoord met keys: "reply" (string), "micro_topic" (string)${
       mustCoach ? ', "coach" (string[])' : ""
@@ -183,7 +186,8 @@ Beoogd JSON:
 {
   "reply": "1–2 zinnen",
   "micro_topic": "nieuw micro-onderwerp"${
-    mustCoach ? `,\n  "coach": ["tip1","tip2"]` : ""
+    mustCoach ? `,
+  "coach": ["tip1","tip2"]` : ""
   }
 }
 `.trim();
@@ -213,7 +217,7 @@ Beoogd JSON:
       console.log(`[simulator:${rid}] openai_error`, r.status, detail.slice(0, 200));
       if (detail.includes("insufficient_quota")) {
         const reply =
-          lang === "nl"
+          language.startsWith("nl")
             ? "Ik had even een hikje. Probeer het nog eens?"
             : "I glitched for a sec. Try again?";
         return json(
@@ -236,8 +240,8 @@ Beoogd JSON:
     const micro_topic = clean(parsed?.micro_topic ?? "");
     let coach = Array.isArray(parsed?.coach) ? parsed.coach.slice(0, 3) : undefined;
 
-    // 2) NL fallback-vertaling
-    if (lang === "nl" && looksEnglish(reply)) {
+    // 2) Forceer vertaling altijd wanneer target ≠ English
+    if (!language.startsWith("en")) {
       const r2 = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
         headers: {
@@ -250,8 +254,7 @@ Beoogd JSON:
           messages: [
             {
               role: "system",
-              content:
-                "Vertaal naar natuurlijk Nederlands, kort (max 30 woorden). Geef alleen de zin(nen), zonder aanhalingstekens.",
+              content: `Translate to natural ${target}, keep it short (≤30 words). Return only the sentence(s), no quotes.`,
             },
             { role: "user", content: reply },
           ],
@@ -262,7 +265,7 @@ Beoogd JSON:
     }
 
     console.log(`[simulator:${rid}] ok`, {
-      lang,
+      language,
       tone,
       persona,
       hasHistory: history.length > 0,

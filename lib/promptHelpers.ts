@@ -104,3 +104,5 @@ export const stripLines = (text: string) =>
 /* ---------- Reparatie-prompt als model geen 5 geeft ---------- */
 export const formatRepairSystem = (lang: LangKey, tone: ToneKey) =>
   `Convert input into EXACTLY 5 standalone natural ${LANG_NAME[lang] || "target language"} lines (style: ${tone}). Each on a new line. No numbering. No quotes.`;
+
+

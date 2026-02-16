@@ -1,15 +1,15 @@
 // api/ocr.ts — OpenAI Vision primary, OCR.space fallback (Edge) + optional last-question reply
 export const config = { runtime: "edge" };
 
-import { languageNameFromCode } from "../lib/lang"; // ✅ nieuw
+import { languageNameFromCode } from "../lib/lang"; // ✅ taalnaam helper
 
 type Body = {
   imageBase64?: string;
   image?: string;
-  language?: string; // ✅ any BCP-47-ish code (e.g. 'de', 'pt-BR', 'zh', 'nl')
+  language?: string; // any BCP-47-ish code (e.g. 'de', 'pt-BR', 'zh', 'nl')
   debug?: boolean;
 
-  // Nieuw: optionele reply-generator op basis van de laatste vraag
+  // Optioneel: reply-generator op basis van de laatste vraag
   answerLastQuestion?: boolean; // true => genereer antwoord
   coachPersona?: "funny" | "classy" | "wing" | string;
   tone?: "safe" | "playful" | "flirty" | string;
@@ -42,7 +42,7 @@ function toDataUrl(b64orDataUrl: string) {
   return `data:image/png;base64,${trimmed}`;
 }
 
-// ✅ Only for OCR engines that support limited langs we collapse to en/nl
+// ✅ Alleen voor OCR engines zelf naar en/nl collapsen
 function langForOCR(full?: string): "nl" | "en" {
   const v = String(full || "en").toLowerCase();
   return v.startsWith("nl") ? "nl" : "en";
@@ -60,8 +60,8 @@ function normalizeText(input: string) {
 }
 
 function extractLastQuestion(text: string) {
-  // Simpele heuristiek: laatste regel met vraagteken
-  const lines = (text || "").split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  // simpele heuristiek: laatste regel met vraagteken
+  const lines = (text || "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   for (let i = lines.length - 1; i >= 0; i--) {
     const l = lines[i];
     if (/[?？！]$/.test(l)) return l;
@@ -72,18 +72,25 @@ function extractLastQuestion(text: string) {
 
 async function generateReplyForLastQuestion(params: {
   ocrText: string;
-  language: string; // ✅ full code used for generation
+  language: string; // full code
   coachPersona?: string;
   tone?: string;
   shortContext?: string;
   model?: string;
   apiKey: string;
 }) {
-  const { ocrText, language, coachPersona = "wing", tone = "playful", shortContext = "", apiKey } = params;
+  const {
+    ocrText,
+    language,
+    coachPersona = "wing",
+    tone = "playful",
+    shortContext = "",
+    apiKey,
+  } = params;
   const model = params.model || "gpt-4o-mini";
   const lastQuestion = extractLastQuestion(ocrText);
 
-  // ✅ gebruik nette taalnaam voor het model
+  // gebruik nette taalnaam in prompt
   const target = languageNameFromCode(language);
 
   const system = `
@@ -127,11 +134,12 @@ Als er geen duidelijke vraag is gevonden, herformuleer dan kort wat een logisch 
   }
 
   const data = await r.json().catch(() => ({} as any));
-  let parsed: { direct?: string; alt1?: string; alt2?: string; coach?: string[] } = {};
+  let parsed: { direct?: string; alt1?: string; alt2?: string; coach?: string[] } =
+    {};
   try {
     parsed = JSON.parse(data?.choices?.[0]?.message?.content ?? "{}");
   } catch {
-    // laat fallback leeg; caller handelt af
+    // fallback: leeg laten, caller handelt het af
   }
 
   return { lastQuestion, ...parsed };
@@ -154,7 +162,8 @@ async function ocrWithOpenAI(
     messages: [
       {
         role: "system",
-        content: "You are a precise OCR assistant. Return only the raw plain text you read.",
+        content:
+          "You are a precise OCR assistant. Return only the raw plain text you read.",
       },
       {
         role: "user",
@@ -205,7 +214,10 @@ async function ocrWithOcrSpace(
 
   const r = await fetch("https://api.ocr.space/parse/image", {
     method: "POST",
-    headers: { apikey: key, "content-type": "application/x-www-form-urlencoded" },
+    headers: {
+      apikey: key,
+      "content-type": "application/x-www-form-urlencoded",
+    },
     body: form.toString(),
   });
 
@@ -217,7 +229,7 @@ async function ocrWithOcrSpace(
   const data = await r.json().catch(() => ({} as any));
   const parts: string[] =
     (data?.ParsedResults || [])
-      .map((pr: any) => (pr?.ParsedText || ""))
+      .map((pr: any) => pr?.ParsedText || "")
       .filter(Boolean) || [];
 
   const text = normalizeText(parts.join(" ").trim());
@@ -234,40 +246,59 @@ export default async function handler(req: Request) {
         hint:
           "POST { imageBase64|image, language?: string, debug?: true, " +
           "answerLastQuestion?: true, coachPersona?, tone?, shortContext?, model? }",
-        visionModel: process.env.OPENAI_VISION_MODEL || "gpt-4o-mini",
+        visionModel:
+          process.env.OPENAI_VISION_MODEL ||
+          process.env.OPENAI_MODEL ||
+          "gpt-4o-mini",
       },
       200
     );
   }
 
-  if (req.method !== "POST") return json({ error: "Method Not Allowed" }, 405);
+  if (req.method !== "POST")
+    return json({ error: "Method Not Allowed" }, 405);
 
   try {
-    const body = (await req.json()) as Body;
+    const body = (await req.json().catch(
+      () => ({} as Body)
+    )) as Body;
+
     const rawImage = pickImageField(body);
 
     if (!rawImage) {
       return json(
-        { error: "missing_image", message: "Missing 'imageBase64' (or 'image') in body" },
+        {
+          error: "missing_image",
+          message: "Missing 'imageBase64' (or 'image') in body",
+        },
         400
       );
     }
 
-    // ✅ Full language passthrough + derived lang for OCR engines
+    // Full language passthrough + derived lang for OCR engines
     const languageFull = String(body.language || "en").toLowerCase();
-    const lang = langForOCR(languageFull); // only for OCR engines & simple prompts
+    const lang = langForOCR(languageFull); // alleen voor OCR engines & simpele prompts
 
     const dataUrl = toDataUrl(rawImage);
-    const base64Len =
-      dataUrl.startsWith("data:image/")
-        ? (dataUrl.split(",")[1] || "").length
-        : rawImage.length;
+    const base64Len = dataUrl.startsWith("data:image/")
+      ? (dataUrl.split(",")[1] || "").length
+      : rawImage.length;
+
+    if (body.debug) {
+      console.log("[OCR] Incoming request", {
+        languageFull,
+        langForOcr: lang,
+        hasImage: !!rawImage,
+        base64Len,
+      });
+    }
 
     if (base64Len < 1000) {
       return json(
         {
           error: "image_too_small",
-          message: "Base64 lijkt te klein om tekst uit te lezen. Stuur een volledige screenshot (PNG/JPG).",
+          message:
+            "Base64 lijkt te klein om tekst uit te lezen. Stuur een volledige screenshot (PNG/JPG).",
           provider: "none",
           debug: body.debug ? { base64Len } : undefined,
         },
@@ -287,35 +318,76 @@ export default async function handler(req: Request) {
     if (openaiKey) {
       const first = preferredModel || "gpt-4o-mini";
       try {
+        if (body.debug) {
+          console.log("[OCR] Trying OpenAI vision first", {
+            model: first,
+          });
+        }
         const t1 = await ocrWithOpenAI(dataUrl, lang, openaiKey, first);
         if (t1 && t1.length >= 6) {
           text = t1;
           provider = "openai";
           modelUsed = first;
         } else {
-          const fallbackModel = first === "gpt-4o-mini" ? "gpt-4o" : "gpt-4o-mini";
-          const t2 = await ocrWithOpenAI(dataUrl, lang, openaiKey, fallbackModel);
+          const fallbackModel =
+            first === "gpt-4o-mini" ? "gpt-4o" : "gpt-4o-mini";
+          if (body.debug) {
+            console.log("[OCR] OpenAI vision fallback model", {
+              fallbackModel,
+            });
+          }
+          const t2 = await ocrWithOpenAI(
+            dataUrl,
+            lang,
+            openaiKey,
+            fallbackModel
+          );
           if (t2) {
             text = t2;
             provider = "openai";
             modelUsed = fallbackModel;
           }
         }
-      } catch {
+      } catch (err) {
+        if (body.debug) {
+          console.log("[OCR] OpenAI vision error, will try OCR.space:", err);
+        }
         // ga door naar OCR.space
       }
+    } else if (body.debug) {
+      console.log(
+        "[OCR] OPENAI_API_KEY missing — skipping OpenAI vision and using OCR.space only"
+      );
     }
 
     // 2) OCR.space fallback (engine 2 -> engine 1)
     if (!text) {
       try {
-        const t1 = await ocrWithOcrSpace(dataUrl, lang, 2, true, process.env.OCRSPACE_API_KEY);
+        if (body.debug) {
+          console.log("[OCR] Trying OCR.space engine 2");
+        }
+        const t1 = await ocrWithOcrSpace(
+          dataUrl,
+          lang,
+          2,
+          true,
+          process.env.OCRSPACE_API_KEY
+        );
         if (t1) {
           text = t1;
           provider = "ocrspace";
           engineUsed = 2;
         } else {
-          const t2 = await ocrWithOcrSpace(dataUrl, lang, 1, true, process.env.OCRSPACE_API_KEY);
+          if (body.debug) {
+            console.log("[OCR] OCR.space engine 2 empty, trying engine 1");
+          }
+          const t2 = await ocrWithOcrSpace(
+            dataUrl,
+            lang,
+            1,
+            true,
+            process.env.OCRSPACE_API_KEY
+          );
           if (t2) {
             text = t2;
             provider = "ocrspace";
@@ -324,6 +396,9 @@ export default async function handler(req: Request) {
         }
       } catch (err) {
         const msg = String(err || "");
+        if (body.debug) {
+          console.log("[OCR] OCR.space error:", msg);
+        }
         return json(
           {
             error: "ocr_failed",
@@ -334,6 +409,15 @@ export default async function handler(req: Request) {
           502
         );
       }
+    }
+
+    if (body.debug) {
+      console.log("[OCR] Final OCR result meta", {
+        provider,
+        modelUsed,
+        engineUsed,
+        textLen: text?.length || 0,
+      });
     }
 
     // Basis-respons (alleen OCR)
@@ -351,12 +435,13 @@ export default async function handler(req: Request) {
       if (!openaiKey) {
         return json({
           ...base,
-          warning: "answerLastQuestion requested but OPENAI_API_KEY is missing",
+          warning:
+            "answerLastQuestion requested but OPENAI_API_KEY is missing",
         });
       }
       const reply = await generateReplyForLastQuestion({
         ocrText: text,
-        language: languageFull, // ✅ full code for generation (inside we convert to name)
+        language: languageFull,
         coachPersona: body.coachPersona || "wing",
         tone: body.tone || "playful",
         shortContext: body.shortContext || "",
@@ -377,6 +462,10 @@ export default async function handler(req: Request) {
     // Alleen OCR-output
     return json(base, 200);
   } catch (e: any) {
-    return json({ error: "server_error", detail: String(e?.message || e) }, 500);
+    console.log("[OCR] server_error", String(e?.message || e));
+    return json(
+      { error: "server_error", detail: String(e?.message || e) },
+      500
+    );
   }
 }

@@ -1,52 +1,22 @@
 // api/chat.ts
 export const config = { runtime: "edge" };
 
+// ❗ Gebruik dezelfde helpers als suggest.ts
 import {
-  normalizeLang,
   normalizeTone,
   normalizePersona,
-  systemFor,
-  personaHint,
-  toneHint,
-  jsonListSchema,
   stripLines,
   uniq5,
   looksEnglish,
+  jsonListSchema,
+  systemFor,
+  personaHint,
+  toneHint,
   formatRepairSystem,
-} from "../lib/promtHelpers";
+  // ❌ normalizeLang bestaat niet meer → zelf taal normaliseren
+} from "../lib/promptHelpers";
 
-type Body = {
-  input?: string;
-  text?: string;
-  prompt?: string;
-  message?: string;
-  content?: string;
-  language?: string;
-  persona?: "funny" | "classy" | "wing" | "wingwoman" | string;
-  tone?: "safe" | "playful" | "flirty" | string;
-  flirtLevel?: "safe" | "playful" | "flirty" | string;
-};
-
-const languageName = (l: string) =>
-  ({
-    en: "English",
-    nl: "Dutch",
-    hi: "Hindi",
-    zh: "Simplified Chinese",
-    ar: "Arabic",
-    de: "German",
-    es: "Spanish",
-    fr: "French",
-    it: "Italian",
-    ja: "Japanese",
-    ko: "Korean",
-    pl: "Polish",
-    pt: "Portuguese",
-    ru: "Russian",
-    tr: "Turkish",
-  } as Record<string, string>)[l] || "English";
-
-function jsonResp(data: any, status = 200) {
+function json(data: any, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
@@ -58,61 +28,82 @@ function jsonResp(data: any, status = 200) {
   });
 }
 
+// simpele language normalizer (zelfde als aiService)
+function normalizeFullLang(l?: string): string {
+  return String(l ?? "en").toLowerCase();
+}
+
 export default async function handler(req: Request) {
-  if (req.method === "OPTIONS") return jsonResp({}, 200);
-
-  if (req.method === "GET") {
-    return jsonResp({
-      ok: true,
-      hint: "POST { input|text|prompt, language?, persona?, tone? }",
-      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-    });
-  }
-
-  if (req.method !== "POST") return jsonResp({ error: "Method Not Allowed" }, 405);
-
   try {
-    const body = (await req.json().catch(() => ({}))) as Body;
+    if (req.method === "OPTIONS") return json({}, 200);
 
-    const input = String(
-      body.input ?? body.text ?? body.prompt ?? body.message ?? body.content ?? ""
-    ).trim();
+    if (req.method === "GET") {
+      return json({
+        ok: true,
+        hint: "POST { input|text|prompt, language?, persona?, tone? }",
+        model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+      });
+    }
 
-    if (!input) return jsonResp({ error: "missing_input", message: "Send { input } or { text }" }, 400);
+    if (req.method !== "POST") {
+      return json({ error: "method_not_allowed" }, 405);
+    }
 
-    const language = normalizeLang(body.language);
+    const body = await req.json().catch(() => ({}));
+
+    const rawInput =
+      body.input ??
+      body.text ??
+      body.prompt ??
+      body.message ??
+      body.content ??
+      "";
+
+    const input = String(rawInput).trim();
+    if (!input) {
+      return json(
+        { error: "missing_input", message: "Send { input } or { text }" },
+        400
+      );
+    }
+
+    // taal exact doorgeven, geen EN/NL limit meer
+    const language = normalizeFullLang(body.language);
+
     const tone = normalizeTone(body.tone ?? body.flirtLevel);
     const persona = normalizePersona(body.persona);
 
     const key = process.env.OPENAI_API_KEY;
     const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-    // Geen key → dummy
+    /* -------------------------------------------------------
+       GEEN OPENAI KEY → DUMMY SUGGESTIES 
+    ------------------------------------------------------- */
     if (!key) {
-      const lines = uniq5(
-        stripLines(
-          language === "en"
-            ? `Variations on: ${input}\n(2)\n(3)\n(4)\n(5)`
-            : `Variaties op: ${input}\n(2)\n(3)\n(4)\n(5)`
-        )
-      );
-      return jsonResp({
+      const lines = uniq5(stripLines(`Variations:\n${input}\n2\n3\n4\n5`));
+      return json({
         model: "dummy",
         langEcho: language,
-        suggestions: lines.map((text) => ({ style: tone, text })),
+        suggestions: lines.map((text) => ({ text, style: tone })),
       });
     }
 
-    // 1) hoofd-call: vraag JSON
-    const sys = systemFor(language, "list5");
+    /* -------------------------------------------------------
+       1) Hoofd OpenAI call (JSON enforced)
+    ------------------------------------------------------- */
+    const sys = systemFor("en", "list5"); // helpers gebruiken EN/NL → EN werkt altijd stabiel
     const usr =
-      `${personaHint(language, persona)} ${toneHint(language, tone)}\n` +
+      `${personaHint("en", persona)} ${toneHint("en", tone)}\n` +
+      `Write ALL outputs in: ${language}.\n` +
       `Context: ${input}\n` +
       jsonListSchema(tone);
 
     const r = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+      headers: {
+        "content-type": "application/json",
+        Authorization: `Bearer ${key}`,
+      },
       body: JSON.stringify({
         model,
         temperature: 0.7,
@@ -126,95 +117,93 @@ export default async function handler(req: Request) {
 
     if (!r.ok) {
       const detail = await r.text().catch(() => "<no body>");
-      if (detail.includes("insufficient_quota")) {
-        const lines = uniq5(
-          stripLines(
-            language === "en"
-              ? `Variations on: ${input}\n(2)\n(3)\n(4)\n(5)`
-              : `Variaties op: ${input}\n(2)\n(3)\n(4)\n(5)`
-          )
-        );
-        return jsonResp({
-          model: "dummy",
-          langEcho: language,
-          suggestions: lines.map((text) => ({ style: tone, text })),
-          note: "OpenAI quota",
-        });
-      }
-      return jsonResp({ error: "openai_error", detail }, r.status);
+      return json({ error: "openai_error", detail }, r.status);
     }
 
-    const data = await r.json().catch(() => ({}));
+    const data = await r.json();
     let out = data?.choices?.[0]?.message?.content ?? "";
 
-    // 2) probeer JSON te parsen
-    type Sug = { text: string; style?: string; why?: string };
-    let suggestions: Sug[] = [];
+    /* -------------------------------------------------------
+       2) JSON parse proberen
+    ------------------------------------------------------- */
+    let suggestions: { text: string; style?: string }[] = [];
     try {
       const parsed = JSON.parse(out);
-      if (Array.isArray(parsed?.suggestions)) suggestions = parsed.suggestions;
-    } catch {
-      // ignore
-    }
+      if (Array.isArray(parsed?.suggestions)) {
+        suggestions = parsed.suggestions;
+      }
+    } catch {}
 
-    // 3) Fallback als geen JSON: text → strip/uniq
+    /* -------------------------------------------------------
+       3) Fallback → text strippen indien geen JSON
+    ------------------------------------------------------- */
     if (!suggestions.length) {
-      // Universele vertaalfallback voor alle niet-EN talen
       if (language !== "en" && looksEnglish(out)) {
-        const r2 = await fetch("https://api.openai.com/v1/chat/completions", {
+        const tr = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
-          headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+          headers: {
+            "content-type": "application/json",
+            Authorization: `Bearer ${key}`,
+          },
           body: JSON.stringify({
             model,
             temperature: 0,
             messages: [
               {
                 role: "system",
-                content: `Translate to natural ${languageName(
-                  language
-                )}. Return 5 separate single-line suggestions, no numbering or quotes.`,
+                content: `Translate to ${language}. Return 5 lines.`,
               },
               { role: "user", content: out },
             ],
           }),
         });
-        const d2 = await r2.json().catch(() => ({}));
-        out = d2?.choices?.[0]?.message?.content ?? out;
+        const translated = await tr.json().catch(() => ({}));
+        out = translated?.choices?.[0]?.message?.content ?? out;
       }
 
       const lines = uniq5(stripLines(out));
       suggestions = lines.map((t) => ({ text: t, style: tone }));
     }
 
-    // 4) Format-repair naar EXACT 5 indien nodig
+    /* -------------------------------------------------------
+       4) Format repair → EXACT 5 rules
+    ------------------------------------------------------- */
     if (suggestions.length !== 5) {
       const fmt = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+        headers: {
+          "content-type": "application/json",
+          Authorization: `Bearer ${key}`,
+        },
         body: JSON.stringify({
           model,
           temperature: 0.2,
           messages: [
-            { role: "system", content: formatRepairSystem(language, tone) },
-            { role: "user", content: suggestions.map((s) => s.text).join("\n") || out },
+            { role: "system", content: formatRepairSystem("en", tone) },
+            {
+              role: "user",
+              content: suggestions.map((s) => s.text).join("\n") || out,
+            },
           ],
         }),
       });
+
       const fmtData = await fmt.json().catch(() => ({}));
       const fixed = fmtData?.choices?.[0]?.message?.content ?? out;
       const lines = uniq5(stripLines(fixed));
       suggestions = lines.map((t) => ({ text: t, style: tone }));
     }
 
-    // (extra: cap op 5)
-    suggestions = suggestions.slice(0, 5).map((s) => ({ text: s.text, style: s.style || tone }));
-
-    return jsonResp({
+    /* -------------------------------------------------------
+       5) Final return
+    ------------------------------------------------------- */
+    return json({
+      ok: true,
       model,
       langEcho: language,
-      suggestions,
+      suggestions: suggestions.slice(0, 5),
     });
   } catch (e: any) {
-    return jsonResp({ error: "server_error", detail: String(e) }, 500);
+    return json({ error: "server_error", detail: String(e) }, 500);
   }
 }

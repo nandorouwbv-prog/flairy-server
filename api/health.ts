@@ -1,9 +1,11 @@
 // api/health.ts
+
+// Draai deze route als Edge function (sneller, minder cold starts)
 export const config = { runtime: "edge" };
 
-import { SUPPORTED_LANGS } from "../lib/promtHelpers";
+import { SUPPORTED_LANGS } from "../lib/promptHelpers";
 
-function json(data: any, status = 200) {
+function json(data: any, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
@@ -16,7 +18,8 @@ function json(data: any, status = 200) {
   });
 }
 
-export default async function handler(req: Request) {
+export default async function handler(req: Request): Promise<Response> {
+  // CORS preflight
   if (req.method === "OPTIONS") return json({}, 200);
 
   const hasOpenAI = !!process.env.OPENAI_API_KEY;
@@ -25,7 +28,10 @@ export default async function handler(req: Request) {
   const hasOCRSpace = !!process.env.OCRSPACE_API_KEY;
 
   // Welke provider zou gebruikt worden?
-  const suggestProvider = hasOpenAI ? `openai:${openaiModel || "gpt-4o-mini"}` : "dummy";
+  const suggestProvider = hasOpenAI
+    ? `openai:${openaiModel || "gpt-4o-mini"}`
+    : "dummy";
+
   let ocrProvider: string;
   if (hasOpenAI && openaiVisionModel) {
     ocrProvider = `openai-vision:${openaiVisionModel}`;
@@ -48,9 +54,7 @@ export default async function handler(req: Request) {
       suggest: suggestProvider,
       ocr: ocrProvider,
     },
-    supportedLanguages: SUPPORTED_LANGS, // 👈 nieuw
-    defaultLanguage: "en",               // 👈 nieuw (server default)
+    supportedLanguages: SUPPORTED_LANGS, // 👈 lijst uit promptHelpers
+    defaultLanguage: "en",               // 👈 server default
   });
 }
-
-

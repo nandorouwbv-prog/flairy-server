@@ -19,7 +19,8 @@
   },
   "homepage": "https://github.com/nandorouwbv-prog/flairy-server#readme",
   "devDependencies": {
-    "@types/node": "^24.3.0"
+    "@types/node": "^24.3.0",
+    "@vercel/node": "^5.6.3"
   },
   "dependencies": {
     "undici-types": "^7.10.0"

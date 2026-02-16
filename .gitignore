@@ -11,3 +11,4 @@ yarn.lock
 .vercel/
 dist/
 build/
+.vercel
